@@ -4770,9 +4770,397 @@ static int objc_bridge32_dispatch_body(const char *import_name,
  * dispatch_named_import and objc_bridge32_dispatch_body entirely.  The chain
  * cases below call these same functions; keep them the only implementation.
  */
+/* LP32_TRACE_GUEST_CALLERS: list the guest code addresses on the stack above
+   a call's arguments, a cheap backtrace for the stripped guest image. */
+static void trace_guest_callers(const char *what, const uint32_t *arguments)
+{
+    if (!getenv("LP32_TRACE_GUEST_CALLERS") || !arguments) return;
+    uint32_t text_end = lp32_profile()->image_end;
+    fprintf(stderr, "compat32: guest callers of %s:", what);
+    for (int i = -1; i < 160; ++i) {
+        uint32_t value = arguments[i];
+        if (value >= 0x2000 && value < text_end && value < 0x00685000)
+            fprintf(stderr, " [%d]0x%08x", i, value);
+    }
+    fprintf(stderr, "\n");
+}
+
 #define FAST_GL(name) \
     static uint64_t fast_##name(const uint32_t *arguments, \
                                 uint32_t return_address)
+
+/*
+ * Green-button fullscreen (Bejeweled 3).  The window's green button sends
+ * -toggleFullScreen:, which would start AppKit's own fullscreen behind the
+ * game's back.  Instead it queues the game's own screen-mode switch, the one
+ * its Options checkbox and windowed button run, and the event pump below
+ * makes the call between frames.  The game's fullscreen covers the whole
+ * screen at backing resolution (see enterFullScreenMode:withOptions:).
+ * Addresses are Bejeweled 3 1.1.12.4196: Bej3App::SwitchScreenMode(bool
+ * wantWindowed, bool is3D, bool force) is slot 67 of the Bej3App vtable, and
+ * the app object is reached through the global the game itself reads it from.
+ */
+static bool bj3_game_fullscreen;
+static bool bj3_mode_switch_pending;
+static NSWindow *bj3_game_window;
+
+static void bj3_toggle_full_screen(id self, SEL _cmd, id sender)
+{
+    (void)self; (void)sender;
+    if (getenv("LP32_TRACE_DISPLAY"))
+        fprintf(stderr, "compat32: window %s\n", sel_getName(_cmd));
+    bj3_mode_switch_pending = true;
+}
+
+static void bj3_run_pending_mode_switch(void)
+{
+    if (!bj3_mode_switch_pending) return;
+    bj3_mode_switch_pending = false;
+    enum {
+        kBej3AppGlobal = 0x00ab835c,
+        kBej3AppVtable = 0x00aad5e8,
+        kBej3SwitchScreenMode = 0x000addbe,
+        kGuestHeapFloor = 0x02000000,
+    };
+    uint32_t app = *(volatile const uint32_t *)(uintptr_t)kBej3AppGlobal;
+    if (app < kGuestHeapFloor ||
+        *(const uint32_t *)(uintptr_t)app != kBej3AppVtable) {
+        fprintf(stderr, "compat32: green-button fullscreen: no Bej3App at "
+                "0x%08x\n", app);
+        return;
+    }
+    uint32_t call[4] = {app, bj3_game_fullscreen ? 1u : 0u, 1u, 0u};
+    fprintf(stderr, "compat32: green-button fullscreen: switching to %s\n",
+            bj3_game_fullscreen ? "windowed" : "fullscreen");
+    compat_runtime32_call(kBej3SwitchScreenMode, call, 4);
+}
+
+/* LP32_TEST_GREEN_BUTTON_SWAPS=a,b,...: press the window's green button at
+   those swap counts, through the same -toggleFullScreen: a click sends. */
+static void bj3_run_test_green_button(void)
+{
+    static const char *list = (const char *)1;
+    if (list == (const char *)1) list = getenv("LP32_TEST_GREEN_BUTTON_SWAPS");
+    if (!list || !bj3_game_window) return;
+    for (const char *cursor = list; *cursor;) {
+        char *end = NULL;
+        unsigned long long swap = strtoull(cursor, &end, 10);
+        if (end == cursor) break;
+        if (swap == objc_bridge_swap_count) {
+            fprintf(stderr, "compat32: test green button at swap %llu\n", swap);
+            [bj3_game_window toggleFullScreen:nil];
+        }
+        cursor = *end ? end + 1 : end;
+    }
+}
+
+/*
+ * Fullscreen title bar (Bejeweled 3).  The game's fullscreen is an NSView
+ * fullscreen window with no title bar, which left no traffic lights to get
+ * out with.  Behave like a native app's fullscreen instead: when the pointer
+ * reaches the top edge, the auto-hidden menu bar drops down and a title bar
+ * with close / hide / windowed buttons slides in beneath it; it goes away
+ * again once the pointer moves back into the game.  Polled once per frame
+ * from the present path.  Control-Command-F toggles fullscreen as well.
+ */
+static void bj3_controls_close(void) { [bj3_game_window performClose:nil]; }
+static void bj3_controls_hide(void) { [NSApp hide:nil]; }
+static void bj3_controls_windowed(void) { bj3_mode_switch_pending = true; }
+
+@interface LP32FullscreenTitlePanel : NSPanel
+@end
+@implementation LP32FullscreenTitlePanel
+/* Standard window buttons send their actions to their own window. */
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (void)performClose:(id)sender { (void)sender; bj3_controls_close(); }
+- (void)performMiniaturize:(id)sender { (void)sender; bj3_controls_hide(); }
+- (void)performZoom:(id)sender { (void)sender; bj3_controls_windowed(); }
+- (void)zoom:(id)sender { (void)sender; bj3_controls_windowed(); }
+- (void)toggleFullScreen:(id)sender { (void)sender; bj3_controls_windowed(); }
+- (void)closeGame:(id)sender { (void)sender; bj3_controls_close(); }
+- (void)hideGame:(id)sender { (void)sender; bj3_controls_hide(); }
+- (void)leaveFullscreen:(id)sender { (void)sender; bj3_controls_windowed(); }
+@end
+
+/* AppKit's standard window buttons draw grey in a window that is not key,
+   and this panel must never take key status from the game, so the three
+   buttons are drawn here in their usual colours, with the glyphs shown while
+   the pointer is over the group. */
+@interface LP32TrafficLight : NSView {
+@public
+    int kind_;
+    BOOL hover_, pressed_;
+    id target_;
+    SEL action_;
+}
+@end
+@implementation LP32TrafficLight
+- (void)drawRect:(NSRect)dirty
+{
+    (void)dirty;
+    static const CGFloat colours[3][3] = {
+        {1.00, 0.373, 0.341}, {0.996, 0.737, 0.180}, {0.157, 0.784, 0.251}};
+    CGFloat shade = pressed_ ? 0.8 : 1.0;
+    NSRect circle = NSInsetRect([self bounds], 1, 1);
+    NSBezierPath *path = [NSBezierPath bezierPathWithOvalInRect:circle];
+    [[NSColor colorWithSRGBRed:colours[kind_][0] * shade
+                         green:colours[kind_][1] * shade
+                          blue:colours[kind_][2] * shade alpha:1] setFill];
+    [path fill];
+    [[NSColor colorWithWhite:0 alpha:0.18] setStroke];
+    [path setLineWidth:0.5];
+    [path stroke];
+    if (!hover_) return;
+    [[NSColor colorWithWhite:0 alpha:0.55] set];
+    NSPoint c = NSMakePoint(NSMidX(circle), NSMidY(circle));
+    CGFloat r = NSWidth(circle) * 0.22;
+    NSBezierPath *glyph = [NSBezierPath bezierPath];
+    [glyph setLineWidth:1.2];
+    [glyph setLineCapStyle:NSLineCapStyleRound];
+    if (kind_ == 0) {
+        [glyph moveToPoint:NSMakePoint(c.x - r, c.y - r)];
+        [glyph lineToPoint:NSMakePoint(c.x + r, c.y + r)];
+        [glyph moveToPoint:NSMakePoint(c.x - r, c.y + r)];
+        [glyph lineToPoint:NSMakePoint(c.x + r, c.y - r)];
+        [glyph stroke];
+    } else if (kind_ == 1) {
+        [glyph moveToPoint:NSMakePoint(c.x - r - 1, c.y)];
+        [glyph lineToPoint:NSMakePoint(c.x + r + 1, c.y)];
+        [glyph stroke];
+    } else {
+        /* Leave fullscreen: two corner triangles pointing inward. */
+        CGFloat q = r + 1.2, g = 0.6;
+        [glyph moveToPoint:NSMakePoint(c.x - g, c.y + g)];
+        [glyph lineToPoint:NSMakePoint(c.x - q, c.y + g)];
+        [glyph lineToPoint:NSMakePoint(c.x - g, c.y + q)];
+        [glyph closePath];
+        [glyph moveToPoint:NSMakePoint(c.x + g, c.y - g)];
+        [glyph lineToPoint:NSMakePoint(c.x + q, c.y - g)];
+        [glyph lineToPoint:NSMakePoint(c.x + g, c.y - q)];
+        [glyph closePath];
+        [glyph fill];
+    }
+}
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
+- (void)mouseDown:(NSEvent *)event { (void)event; pressed_ = YES; [self setNeedsDisplay:YES]; }
+- (void)mouseUp:(NSEvent *)event
+{
+    pressed_ = NO;
+    [self setNeedsDisplay:YES];
+    NSPoint point = [self convertPoint:[event locationInWindow] fromView:nil];
+    if (NSPointInRect(point, [self bounds]) && action_)
+        [NSApp sendAction:action_ to:target_ from:self];
+}
+@end
+
+@interface LP32TrafficLightGroup : NSView {
+    NSTrackingArea *tracking_;
+}
+@end
+@implementation LP32TrafficLightGroup
+- (void)updateTrackingAreas
+{
+    if (tracking_) {
+        [self removeTrackingArea:tracking_];
+        [tracking_ release];
+    }
+    tracking_ = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+             options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                     NSTrackingInVisibleRect
+               owner:self userInfo:nil];
+    [self addTrackingArea:tracking_];
+    [super updateTrackingAreas];
+}
+- (void)dealloc { [tracking_ release]; [super dealloc]; }
+- (void)setHover:(BOOL)hover
+{
+    for (LP32TrafficLight *light in [self subviews]) {
+        light->hover_ = hover;
+        [light setNeedsDisplay:YES];
+    }
+}
+- (void)mouseEntered:(NSEvent *)event { (void)event; [self setHover:YES]; }
+- (void)mouseExited:(NSEvent *)event { (void)event; [self setHover:NO]; }
+@end
+
+static NSPanel *bj3_title_panel;
+static NSScreen *bj3_title_screen;
+static bool bj3_title_visible;
+enum { kBj3TitleBarHeight = 28 };
+
+static double bj3_menu_bar_height(NSScreen *screen)
+{
+    double height = [[NSStatusBar systemStatusBar] thickness];
+    if (@available(macOS 12.0, *)) {
+        if ([screen safeAreaInsets].top > height) height = [screen safeAreaInsets].top;
+    }
+    return height;
+}
+
+static void bj3_hide_fullscreen_controls(void)
+{
+    if (!bj3_title_panel) return;
+    [bj3_title_panel orderOut:nil];
+    [bj3_title_panel release];
+    bj3_title_panel = nil;
+    bj3_title_screen = nil;
+    bj3_title_visible = false;
+}
+
+static void bj3_set_title_visible(bool visible)
+{
+    if (!bj3_title_panel || visible == bj3_title_visible) return;
+    bj3_title_visible = visible;
+    [[bj3_title_panel animator] setAlphaValue:visible ? 1.0 : 0.0];
+    [bj3_title_panel setIgnoresMouseEvents:!visible];
+}
+
+static void bj3_show_fullscreen_controls(NSScreen *screen, NSWindow *over)
+{
+    bj3_hide_fullscreen_controls();
+    if (!screen || getenv("LP32_NO_FULLSCREEN_TITLE")) return;
+    NSRect screen_frame = [screen frame];
+    NSRect frame = NSMakeRect(NSMinX(screen_frame),
+                              NSMaxY(screen_frame) - bj3_menu_bar_height(screen) -
+                                  kBj3TitleBarHeight,
+                              NSWidth(screen_frame), kBj3TitleBarHeight);
+    LP32FullscreenTitlePanel *panel = [[LP32FullscreenTitlePanel alloc]
+        initWithContentRect:frame
+                  styleMask:NSWindowStyleMaskBorderless |
+                            NSWindowStyleMaskNonactivatingPanel
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    [panel setOpaque:NO];
+    [panel setBackgroundColor:[NSColor clearColor]];
+    [panel setHasShadow:YES];
+    [panel setHidesOnDeactivate:YES];
+    [panel setFloatingPanel:YES];
+    [panel setLevel:(over ? [over level] : NSStatusWindowLevel) + 1];
+    [panel setCollectionBehavior:NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                 NSWindowCollectionBehaviorStationary];
+    NSVisualEffectView *bar = [[NSVisualEffectView alloc]
+        initWithFrame:NSMakeRect(0, 0, frame.size.width, frame.size.height)];
+    [bar setMaterial:NSVisualEffectMaterialTitlebar];
+    [bar setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+    [bar setState:NSVisualEffectStateActive];
+    NSString *window_title = [bj3_game_window title];
+    NSTextField *title = [NSTextField labelWithString:
+        [window_title length] ? window_title : @"Bejeweled 3"];
+    [title setFont:[NSFont titleBarFontOfSize:0]];
+    [title setTextColor:[NSColor labelColor]];
+    [title sizeToFit];
+    [title setFrameOrigin:NSMakePoint(floor((frame.size.width - NSWidth([title frame])) / 2),
+                                      floor((kBj3TitleBarHeight - NSHeight([title frame])) / 2))];
+    [bar addSubview:title];
+    const SEL actions[3] = {
+        @selector(closeGame:), @selector(hideGame:), @selector(leaveFullscreen:)};
+    enum { kLight = 14, kLightPitch = 20 };
+    LP32TrafficLightGroup *group = [[LP32TrafficLightGroup alloc]
+        initWithFrame:NSMakeRect(8, floor((kBj3TitleBarHeight - kLight) / 2),
+                                 2 * kLightPitch + kLight, kLight)];
+    for (int i = 0; i < 3; ++i) {
+        LP32TrafficLight *light = [[LP32TrafficLight alloc]
+            initWithFrame:NSMakeRect(i * kLightPitch, 0, kLight, kLight)];
+        light->kind_ = i;
+        light->target_ = panel;
+        light->action_ = actions[i];
+        [group addSubview:light];
+        [light release];
+    }
+    [bar addSubview:group];
+    [group release];
+    [panel setContentView:bar];
+    [bar release];
+    [panel setAlphaValue:0.0];
+    [panel setIgnoresMouseEvents:YES];
+    [panel orderFrontRegardless];
+    bj3_title_panel = panel;
+    bj3_title_screen = screen;
+    bj3_title_visible = false;
+    if (getenv("LP32_TEST_SHOW_FULLSCREEN_TITLE")) bj3_set_title_visible(true);
+}
+
+/* Per frame: reveal at the top edge, as AppKit reveals the menu bar; keep it
+   while the pointer is over the menu bar or title bar. */
+static void bj3_poll_fullscreen_title(void)
+{
+    if (!bj3_title_panel || !bj3_title_screen ||
+        getenv("LP32_TEST_SHOW_FULLSCREEN_TITLE")) return;
+    NSPoint mouse = [NSEvent mouseLocation];
+    NSRect screen_frame = [bj3_title_screen frame];
+    if (mouse.x < NSMinX(screen_frame) || mouse.x >= NSMaxX(screen_frame)) {
+        bj3_set_title_visible(false);
+        return;
+    }
+    double from_top = NSMaxY(screen_frame) - mouse.y;
+    if (from_top <= 2) {
+        bj3_set_title_visible(true);
+    } else if (from_top > bj3_menu_bar_height(bj3_title_screen) +
+                              kBj3TitleBarHeight + 8) {
+        bj3_set_title_visible(false);
+    }
+}
+
+/*
+ * Retina rendering (Bejeweled 3).  The game's SexyOpenGLView gets a
+ * best-resolution surface, so the window-system framebuffer is in backing
+ * pixels while the game still sizes its viewport and scissor from view bounds
+ * in points.  Keep the guest's values in points and scale them whenever the
+ * default framebuffer is bound; the game's own FBOs (sized in texels) pass
+ * through untouched.  Re-applying on every framebuffer bind keeps this right
+ * whichever order the game sets viewport and binding in.  LP32_NO_RETINA=1
+ * turns it off.
+ */
+static bool retina_rendering_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = lp32_profile()->title == LP32_TITLE_BEJEWELED3 &&
+                  !getenv("LP32_NO_RETINA");
+    }
+    return enabled;
+}
+static GLint retina_guest_viewport[4];
+static GLint retina_guest_scissor[4];
+static bool retina_have_viewport, retina_have_scissor;
+static bool retina_default_framebuffer = true;
+
+static double retina_backing_scale(void)
+{
+    static double cached = 1.0;
+    static uint64_t cached_swap = UINT64_MAX;
+    if (cached_swap == objc_bridge_swap_count) return cached;
+    cached_swap = objc_bridge_swap_count;
+    cached = 1.0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    NSView *view = [[NSOpenGLContext currentContext] view];
+    if (view && [view wantsBestResolutionOpenGLSurface]) {
+        NSRect bounds = [view bounds];
+        if (bounds.size.width > 0) {
+            cached = [view convertRectToBacking:bounds].size.width /
+                     bounds.size.width;
+        }
+    }
+#pragma clang diagnostic pop
+    return cached;
+}
+static void retina_apply_rect(const GLint *rect, bool viewport)
+{
+    double scale = retina_default_framebuffer ? retina_backing_scale() : 1.0;
+    GLint x = (GLint)lround(rect[0] * scale), y = (GLint)lround(rect[1] * scale);
+    GLsizei width = (GLsizei)lround(rect[2] * scale);
+    GLsizei height = (GLsizei)lround(rect[3] * scale);
+    if (viewport) glViewport(x, y, width, height);
+    else glScissor(x, y, width, height);
+}
+static void retina_framebuffer_bound(GLuint framebuffer)
+{
+    retina_default_framebuffer = framebuffer == 0;
+    if (retina_have_viewport) retina_apply_rect(retina_guest_viewport, true);
+    if (retina_have_scissor) retina_apply_rect(retina_guest_scissor, false);
+}
 
 FAST_GL(glVertexAttribPointer)
 {
@@ -5081,11 +5469,34 @@ FAST_GL(glCullFace)   { (void)return_address; glCullFace(arguments[0]); return 0
 FAST_GL(glDepthFunc)  { (void)return_address; glDepthFunc(arguments[0]); return 0; }
 FAST_GL(glDepthMask)  { (void)return_address; glDepthMask(arguments[0]); return 0; }
 FAST_GL(glFrontFace)  { (void)return_address; glFrontFace(arguments[0]); return 0; }
-FAST_GL(glScissor)    { (void)return_address; glScissor(arguments[0], arguments[1], arguments[2], arguments[3]); return 0; }
+FAST_GL(glScissor)    {
+    (void)return_address;
+    if (retina_rendering_enabled()) {
+        for (int i = 0; i < 4; ++i) retina_guest_scissor[i] = (GLint)arguments[i];
+        retina_have_scissor = true;
+        retina_apply_rect(retina_guest_scissor, false);
+        return 0;
+    }
+    glScissor(arguments[0], arguments[1], arguments[2], arguments[3]);
+    return 0;
+}
 FAST_GL(glStencilFunc){ (void)return_address; glStencilFunc(arguments[0], arguments[1], arguments[2]); return 0; }
 FAST_GL(glStencilMask){ (void)return_address; glStencilMask(arguments[0]); return 0; }
 FAST_GL(glStencilOp)  { (void)return_address; glStencilOp(arguments[0], arguments[1], arguments[2]); return 0; }
-FAST_GL(glGetIntegerv){ (void)return_address; glGetIntegerv(arguments[0], (GLint *)(uintptr_t)arguments[1]); return 0; }
+FAST_GL(glGetIntegerv){
+    (void)return_address;
+    GLint *values = (GLint *)(uintptr_t)arguments[1];
+    glGetIntegerv(arguments[0], values);
+    /* Report the viewport and scissor box in the points the game set. */
+    if (retina_rendering_enabled() && values) {
+        if (arguments[0] == GL_VIEWPORT && retina_have_viewport) {
+            memcpy(values, retina_guest_viewport, sizeof(retina_guest_viewport));
+        } else if (arguments[0] == GL_SCISSOR_BOX && retina_have_scissor) {
+            memcpy(values, retina_guest_scissor, sizeof(retina_guest_scissor));
+        }
+    }
+    return 0;
+}
 FAST_GL(glGetFloatv)  { (void)return_address; glGetFloatv(arguments[0], (GLfloat *)(uintptr_t)arguments[1]); return 0; }
 /* Hot per-draw entry points on Bejeweled 3's board (client-array sprites).
    Kept on the fast path so the thousands of calls per frame skip the name
@@ -5186,6 +5597,13 @@ FAST_GL(glViewport) {
     (void)return_address;
     GLint x = (GLint)arguments[0], y = (GLint)arguments[1];
     GLsizei width = (GLsizei)arguments[2], height = (GLsizei)arguments[3];
+    if (retina_rendering_enabled()) {
+        retina_guest_viewport[0] = x; retina_guest_viewport[1] = y;
+        retina_guest_viewport[2] = width; retina_guest_viewport[3] = height;
+        retina_have_viewport = true;
+        retina_apply_rect(retina_guest_viewport, true);
+        return 0;
+    }
     pg_adjust_fullscreen_viewport(&x, &y, &width, &height);
     glViewport(x, y, width, height);
     return 0;
@@ -5222,7 +5640,16 @@ FAST_GL(glUseProgram) { (void)return_address; glUseProgram(arguments[0]); return
 FAST_GL(glUniform1i) { (void)return_address; glUniform1i((GLint)arguments[0], (GLint)arguments[1]); return 0; }
 FAST_GL(glUniform4fv) { (void)return_address; glUniform4fv((GLint)arguments[0], (GLsizei)arguments[1], (const GLfloat *)(uintptr_t)arguments[2]); return 0; }
 FAST_GL(glUniformMatrix4fv) { (void)return_address; glUniformMatrix4fv((GLint)arguments[0], (GLsizei)arguments[1], (GLboolean)arguments[2], (const GLfloat *)(uintptr_t)arguments[3]); return 0; }
-FAST_GL(glBindFramebufferEXT) { (void)return_address; glBindFramebufferEXT(arguments[0], arguments[1]); return 0; }
+FAST_GL(glBindFramebufferEXT) {
+    (void)return_address;
+    glBindFramebufferEXT(arguments[0], arguments[1]);
+    if (retina_rendering_enabled() &&
+        (arguments[0] == GL_FRAMEBUFFER_EXT ||
+         arguments[0] == GL_DRAW_FRAMEBUFFER_EXT)) {
+        retina_framebuffer_bound(arguments[1]);
+    }
+    return 0;
+}
 
 #undef FAST_GL
 
@@ -6281,6 +6708,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     arguments[0], arguments[1]);
         }
         glBindFramebuffer(arguments[0], arguments[1]);
+        if (retina_rendering_enabled() &&
+            (arguments[0] == GL_FRAMEBUFFER || arguments[0] == GL_DRAW_FRAMEBUFFER)) {
+            retina_framebuffer_bound(arguments[1]);
+        }
         *result = 0; return 1;
     }
     /* Bejeweled 3's renderer (unlike Peggle's fixed-function path) drives
@@ -6293,7 +6724,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_glBindFramebufferEXT")) {
-        glBindFramebufferEXT(arguments[0], arguments[1]); *result = 0; return 1;
+        *result = fast_glBindFramebufferEXT(arguments, 0); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_glDeleteFramebuffersEXT")) {
         glDeleteFramebuffersEXT((GLsizei)arguments[0], (const GLuint *)(uintptr_t)arguments[1]);
@@ -6836,11 +7267,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     (GLint)arguments[0], (GLint)arguments[1],
                     (GLsizei)arguments[2], (GLsizei)arguments[3]);
         }
-        GLint x = (GLint)arguments[0], y = (GLint)arguments[1];
-        GLsizei width = (GLsizei)arguments[2], height = (GLsizei)arguments[3];
-        pg_adjust_fullscreen_viewport(&x, &y, &width, &height);
-        glViewport(x, y, width, height);
-        *result = 0; return 1;
+        *result = fast_glViewport(arguments, 0); return 1;
     }
     /* Fixed-function immediate mode used by the legacy display path for
        its loading/letterbox quads. */
@@ -7708,6 +8135,22 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             return 1;
         }
         id receiver = object_for_receiver(arguments[0]);
+        /* A handle from the proxy range that no longer resolves is a borrowed
+           callback argument used after its callback returned.  Bejeweled 3's
+           -viewFrameChanged: hit one while switching screen mode; trapping
+           there unwound the whole switch, so the Options toggle took several
+           tries.  Answer it as a message to nil, which is what it now is. */
+        if (!receiver && arguments[0] >= kProxyBase &&
+            arguments[0] < kProxyLimit) {
+            static unsigned stale_reports;
+            if (stale_reports++ < 8) {
+                fprintf(stderr, "compat32: stale proxy 0x%08x sent %s; "
+                        "answering nil\n", arguments[0],
+                        selector_name ? selector_name : "?");
+            }
+            *result = 0;
+            return 1;
+        }
         if (selector_name && strcmp(selector_name, "retain") == 0) {
             int32_t retained = proxy_index_for_handle(arguments[0]);
             if (retained >= 0) proxies[retained].callback_scoped = false;
@@ -7742,6 +8185,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 NSWindow *gl_window = [[gl_context view] window];
 #pragma clang diagnostic pop
                 present_frame_with_stats(gl_context, gl_window, true);
+                bj3_poll_fullscreen_title();
+                bj3_run_test_green_button();
                 *result = 0;
                 return 1;
             }
@@ -7912,6 +8357,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         if (strcmp(selector_name, "exitFullScreenModeWithOptions:") == 0 &&
             [receiver isKindOfClass:[NSView class]]) {
+            trace_guest_callers("exitFullScreenModeWithOptions:", arguments);
+            bj3_game_fullscreen = false;
+            bj3_hide_fullscreen_controls();
             NSWindow *source = objc_getAssociatedObject(receiver, &guest_fullscreen_source_key);
             [(NSView *)receiver exitFullScreenModeWithOptions:object_for_argument(arguments[2])];
             if (source) {
@@ -7923,12 +8371,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             return 1;
         }
         if (strcmp(selector_name, "enterFullScreenMode:withOptions:") == 0) {
+            trace_guest_callers("enterFullScreenMode:withOptions:", arguments);
             /* Bejeweled 3 asks NSView to go fullscreen with options that
                capture the display and disable process switching, which locks
                the operator out (no Cmd-Tab) and hides the surface from screen
                capture.  Present fullscreen on the current Space instead:
                auto-hide the dock/menu bar but keep switching enabled and do
-               not grab all screens. */
+               not grab all screens.  A title bar with traffic lights drops in
+               under the revealed menu bar (bj3_show_fullscreen_controls). */
             NSScreen *screen = object_for_argument(arguments[2]);
             if (!screen) screen = preferred_game_screen();
             NSDictionary *options = @{
@@ -7940,12 +8390,41 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             NSWindow *source = [(NSView *)receiver window];
             BOOL entered = [(NSView *)receiver enterFullScreenMode:screen
                                                        withOptions:options];
+            /* On a notched display AppKit sizes the fullscreen window to the
+               area below the camera housing, while the game lays out for the
+               whole screen frame, so the picture came out squashed.  Cover
+               the whole screen, notch area included. */
+            NSWindow *fullscreen_window = [(NSView *)receiver window];
+            if (entered && fullscreen_window && screen &&
+                !NSEqualRects([fullscreen_window frame], [screen frame])) {
+                [fullscreen_window setFrame:[screen frame] display:YES];
+            }
+            if (entered) {
+                double safe_top = 0;
+                if (@available(macOS 12.0, *)) safe_top = [screen safeAreaInsets].top;
+                NSRect view_frame = [(NSView *)receiver frame];
+                NSRect backing = [(NSView *)receiver convertRectToBacking:
+                                      [(NSView *)receiver bounds]];
+                fprintf(stderr,
+                        "compat32: fullscreen screen=%.0fx%.0f safe-top=%.0f "
+                        "window=%.0fx%.0f view=%.0fx%.0f backing=%.0fx%.0f\n",
+                        [screen frame].size.width, [screen frame].size.height,
+                        safe_top,
+                        [fullscreen_window frame].size.width,
+                        [fullscreen_window frame].size.height,
+                        view_frame.size.width, view_frame.size.height,
+                        backing.size.width, backing.size.height);
+            }
             /* Modern AppKit detaches the content view from its source window.
                Bejeweled still finds its fullscreen view through that window's
                contentView, including for input and the top-right toggle. */
             if (entered && source && guest_instance_for_companion(source)) {
                 objc_setAssociatedObject(source, &guest_fullscreen_content_key, receiver, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(receiver, &guest_fullscreen_source_key, source, OBJC_ASSOCIATION_ASSIGN);
+            }
+            if (entered) {
+                bj3_game_fullscreen = true;
+                bj3_show_fullscreen_controls(screen, fullscreen_window);
             }
             *result = entered ? 1 : 0;
             return 1;
@@ -7964,6 +8443,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (strcmp(selector_name,
                    "nextEventMatchingMask:untilDate:inMode:dequeue:") == 0 &&
             [receiver isKindOfClass:[NSApplication class]]) {
+            /* Between frames, in the game's own event loop: the safe point
+               for a queued green-button mode switch. */
+            bj3_run_pending_mode_switch();
             /*
              * The guest pumps its own event loop (mask 0xffffffff, default
              * mode) after finishLaunching and never enters -[NSApplication
